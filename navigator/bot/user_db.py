@@ -1,44 +1,45 @@
-import sqlite3
+import asyncpg
 import os
+import configparser
 
-# --- Настройки ---
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_NAME = 'users.db'
-DATABASE_PATH = os.path.join(SCRIPT_DIR, '..', 'data', DB_NAME)
+# Глобальный пул соединений
+POOL = None
 
-# --- Инициализация БД ---
-def init_user_db():
-    """Создает и инициализирует базу данных для пользователей."""
-    os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            group_name TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+def get_db_config():
+    config = configparser.ConfigParser()
+    config_path = os.path.join(os.path.dirname(__file__), '..', '..', 'config.ini')
+    config.read(config_path)
+    return config['postgresql']
 
-# --- Функции для работы с пользователями ---
-def get_user_group(user_id: int) -> str | None:
-    """Получает имя группы пользователя по его ID."""
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT group_name FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else None
+async def init_user_db():
+    """Создает и инициализирует пул соединений и таблицу пользователей."""
+    global POOL
+    if POOL is not None:
+        return
+        
+    db_config = get_db_config()
+    POOL = await asyncpg.create_pool(**db_config)
+    
+    async with POOL.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                group_name TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-def set_user_group(user_id: int, group_name: str):
-    """Добавляет или обновляет группу для пользователя."""
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO users (user_id, group_name) VALUES (?, ?)",
-        (user_id, group_name)
-    )
-    conn.commit()
-    conn.close()
+async def get_user_group(user_id: int) -> str | None:
+    """Асинхронно получает имя группы пользователя по его ID."""
+    async with POOL.acquire() as conn:
+        row = await conn.fetchrow("SELECT group_name FROM users WHERE user_id = $1", user_id)
+        return row['group_name'] if row else None
+
+async def set_user_group(user_id: int, group_name: str):
+    """Асинхронно добавляет или обновляет группу для пользователя."""
+    async with POOL.acquire() as conn:
+        # INSERT ... ON CONFLICT (user_id) DO UPDATE ... - идиоматичный способ для PostgreSQL
+        await conn.execute("""
+            INSERT INTO users (user_id, group_name) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET group_name = $2
+        """, user_id, group_name)

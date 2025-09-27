@@ -2,3 +2,6 @@ aiogram
 requests
 beautifulsoup4
 bs4
+aiohttp
+psycopg2-binary
+asyncpg

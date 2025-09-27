@@ -6,66 +6,56 @@ parse_schedule.py — МПТ
 
 * определяет тип недели (Числитель/Знаменатель и т.д.);
 * извлекает список специальностей и групп;
-* для **каждой группы** заносит в SQLite‑БД все пары по дням недели
+* для **каждой группы** заносит в PostgreSQL‑БД все пары по дням недели
   (аудитория, предмет, преподаватель, номер пары, пометка «ПРАКТИКА» — если есть).
 
-CLI‑режимы
-----------
-```
-python parse_schedule.py             # сохранить расписание в schedule.db
-python parse_schedule.py -d mpt.db   # в указанную БД
-python parse_schedule.py --list-groups  # вывести группы и выйти
-```
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import re
-import sqlite3
+import psycopg2
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 import time
+import configparser
+import os
 
 import requests
 from bs4 import BeautifulSoup, Tag
 
 LIVE_URL = "https://mpt.ru/raspisanie/"
-DEFAULT_DB_FILENAME = "schedule.db" # Только имя файла по умолчанию
-PARSING_INTERVAL_SECONDS = 86400
+PARSING_INTERVAL_SECONDS = 21600
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s — %(message)s")
 logger = logging.getLogger(__name__)
 
-# --- Определение пути по умолчанию для БД ---
-SCRIPT_DIR = Path(__file__).resolve().parent
-
-PROJECT_BASE_DIR = SCRIPT_DIR.parent # Это будет .../navigator/ 
-
-# 3. Полный путь к директории 'data' по умолчанию
-DEFAULT_DATA_DIR = PROJECT_BASE_DIR / "data"
-
-# 4. Полный путь к файлу БД по умолчанию
-CONSTRUCTED_DEFAULT_DB_PATH = DEFAULT_DATA_DIR / DEFAULT_DB_FILENAME
+# --- Конфигурация БД ---
+def get_db_config():
+    config = configparser.ConfigParser()
+    config_path = os.path.join(os.path.dirname(__file__), '..', '..', 'config.ini')
+    config.read(config_path)
+    return config['postgresql']
 
 ###############################################################################
 # База данных
 ###############################################################################
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS specializations (
-    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    id   SERIAL PRIMARY KEY,
     name TEXT UNIQUE NOT NULL
 );
 CREATE TABLE IF NOT EXISTS groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
     specialization_id INTEGER NOT NULL,
     UNIQUE(name, specialization_id),
     FOREIGN KEY (specialization_id) REFERENCES specializations(id)
 );
 CREATE TABLE IF NOT EXISTS schedules (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     group_id INTEGER NOT NULL,
     day_of_week TEXT NOT NULL,
     location TEXT,
@@ -78,48 +68,51 @@ CREATE TABLE IF NOT EXISTS schedules (
 );
 """
 
-def init_db(path: Path) -> sqlite3.Connection:
-    # Убедимся, что родительская директория для файла БД существует
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Директория для БД обеспечена/существует: {path.parent}")
-    except OSError as e:
-        logger.error(f"Не удалось создать директорию {path.parent} для БД: {e}")
-        sys.exit(1) # Выход, если не удалось создать директорию
-
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.executescript(SCHEMA_SQL)
+def init_db() -> psycopg2.extensions.connection:
+    db_config = get_db_config()
+    conn = psycopg2.connect(**db_config)
+    
+    # Используем with для автоматического управления курсором
+    with conn.cursor() as cur:
+        cur.execute("PRAGMA foreign_keys = ON;") # PRAGMA - это SQLite-специфичная команда, в PG не нужна
+        # Вместо executescript, который может быть неидеален, выполним каждую команду
+        for statement in SCHEMA_SQL.split(';'):
+            if statement.strip():
+                cur.execute(statement)
+    
     conn.commit()
-    logger.info(f"Соединение с БД установлено: {path}")
+    logger.info(f"Соединение с БД установлено и схема проверена.")
     return conn
 
 ###############################################################################
 # CRUD‑helpers
 ###############################################################################
 
-def get_or_create_specialization(conn: sqlite3.Connection, name: str) -> int:
-    cur = conn.execute("SELECT id FROM specializations WHERE name = ?", (name,))
-    if row := cur.fetchone():
-        return row[0]
-    cur = conn.execute("INSERT INTO specializations(name) VALUES (?)", (name,))
-    conn.commit()
-    return cur.lastrowid
+def get_or_create_specialization(conn: psycopg2.extensions.connection, name: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM specializations WHERE name = %s", (name,))
+        if row := cur.fetchone():
+            return row[0]
+        cur.execute("INSERT INTO specializations(name) VALUES (%s) RETURNING id", (name,))
+        spec_id = cur.fetchone()[0]
+        conn.commit()
+        return spec_id
 
-
-def get_or_create_group(conn: sqlite3.Connection, name: str, spec_id: int) -> int:
-    cur = conn.execute(
-        "SELECT id FROM groups WHERE name = ? AND specialization_id = ?",
-        (name, spec_id),
-    )
-    if row := cur.fetchone():
-        return row[0]
-    cur = conn.execute(
-        "INSERT INTO groups(name, specialization_id) VALUES (?, ?)",
-        (name, spec_id),
-    )
-    conn.commit()
-    return cur.lastrowid
+def get_or_create_group(conn: psycopg2.extensions.connection, name: str, spec_id: int) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM groups WHERE name = %s AND specialization_id = %s",
+            (name, spec_id),
+        )
+        if row := cur.fetchone():
+            return row[0]
+        cur.execute(
+            "INSERT INTO groups(name, specialization_id) VALUES (%s, %s) RETURNING id",
+            (name, spec_id),
+        )
+        group_id = cur.fetchone()[0]
+        conn.commit()
+        return group_id
 
 ###############################################################################
 # Загрузка HTML
@@ -155,7 +148,6 @@ def find_main_container(soup: BeautifulSoup) -> Tag:
             return ul.parent
     raise ParseError("Не нашёл контейнер с вкладками специализаций")
 
-
 def extract_week_type(soup: BeautifulSoup) -> str:
     if m := WEEK_RE.search(soup.get_text(" ", strip=True)):
         return m.group("type")
@@ -190,7 +182,7 @@ def list_groups(html: str) -> Dict[str, List[str]]:
 # Основной парсинг расписания -> БД
 ###############################################################################
 
-def parse_and_store(conn: sqlite3.Connection, html: str) -> None:
+def parse_and_store(conn: psycopg2.extensions.connection, html: str) -> None:
     soup = BeautifulSoup(html, "html.parser")
     week_type = extract_week_type(soup)
     logger.info("Тип недели: %s", week_type)
@@ -212,22 +204,34 @@ def parse_and_store(conn: sqlite3.Connection, html: str) -> None:
             txt = h3.get_text(" ", strip=True)
             if not txt.upper().startswith("ГРУПП"):
                 continue
-            grp_name = txt.replace("Группа ", "").strip()
-            grp_id = get_or_create_group(conn, grp_name, spec_id)
-            logger.info("   Группа: %s", grp_name)
 
+            raw_grp_names = txt.replace("Группа ", "").strip()
+            # Split by semicolon, comma, or slash
+            individual_group_names = [name.strip() for name in re.split(';|,|/', raw_grp_names) if name.strip()]
+
+            if not individual_group_names:
+                continue
+
+            # Get all group IDs for the names found in the h3
+            group_ids = []
+            for name in individual_group_names:
+                grp_id = get_or_create_group(conn, name, spec_id)
+                group_ids.append(grp_id)
+                logger.info("   Группа: %s", name)
+
+            # Find the schedule table and apply it to all groups
             sibling = h3.next_sibling
             while sibling:
                 if isinstance(sibling, Tag) and sibling.name == "h3":
                     break 
-                if isinstance(sibling, Tag) and sibling.name == "table" and \
-                   set(sibling.get("class", [])) & {"table", "table-striped"}:
-                    _parse_group_table(conn, sibling, grp_id, week_type)
+                if isinstance(sibling, Tag) and "table" in sibling.get("class", []):
+                    for grp_id in group_ids:
+                        _parse_group_table(conn, sibling, grp_id, week_type)
                 sibling = sibling.next_sibling
 
     conn.commit()
 
-def _parse_group_table(conn: sqlite3.Connection, tbl: Tag, grp_id: int, week_type: str) -> None:
+def _parse_group_table(conn: psycopg2.extensions.connection, tbl: Tag, grp_id: int, week_type: str) -> None:
     """Разобрать одну таблицу расписания и вставить строки."""
     header_tag = tbl.find("thead").find(["h4", "th", "td"])
     if not header_tag:
@@ -242,53 +246,42 @@ def _parse_group_table(conn: sqlite3.Connection, tbl: Tag, grp_id: int, week_typ
         if header_tag.find("span") else head_txt[len(md.group(0)):].strip() or "Не указано"
     )
 
-    for tr in tbl.select("tbody > tr"):
-        tds = tr.find_all("td")
-        if not tds:
-            continue
-        if len(tds) == 1 and "ПРАКТИКА" in tds[0].text.upper():
-            conn.execute(
-                """INSERT INTO schedules (group_id, day_of_week, location, week_type,
-                                          period_number, subject, teacher, raw_data) 
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (grp_id, day, loc, week_type, "ПРАКТИКА", "ПРАКТИКА", "ПРАКТИКА", tds[0].text.strip()),
-            )
-            continue
-        if len(tds) >= 3:
-            num = tds[0].text.strip()
-            subj = " / ".join(x.text.strip() for x in tds[1].select("div.label")) or tds[1].text.strip()
-            teacher = " / ".join(x.text.strip() for x in tds[2].select("div.label")) or tds[2].text.strip()
-            conn.execute(
-                """INSERT INTO schedules (group_id, day_of_week, location, week_type,
-                                          period_number, subject, teacher) 
-                   VALUES (?,?,?,?,?,?,?)""",
-                (grp_id, day, loc, week_type, num, subj, teacher),
-            )
-        else:
-            raw = " | ".join(td.text.strip() for td in tds)
-            conn.execute(
-                "INSERT INTO schedules (group_id, day_of_week, location, week_type, raw_data) VALUES (?,?,?,?,?)",
-                (grp_id, day, loc, week_type, raw),
-            )
+    with conn.cursor() as cur:
+        for tr in tbl.select("tbody > tr"):
+            tds = tr.find_all("td")
+            if not tds:
+                continue
+            if len(tds) == 1 and "ПРАКТИКА" in tds[0].text.upper():
+                cur.execute(
+                    """INSERT INTO schedules (group_id, day_of_week, location, week_type,
+                                              period_number, subject, teacher, raw_data) 
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (grp_id, day, loc, week_type, "ПРАКТИКА", "ПРАКТИКА", "ПРАКТИКА", tds[0].text.strip()),
+                )
+                continue
+            if len(tds) >= 3:
+                num = tds[0].text.strip()
+                subj = " / ".join(x.text.strip() for x in tds[1].select("div.label")) or tds[1].text.strip()
+                teacher = " / ".join(x.text.strip() for x in tds[2].select("div.label")) or tds[2].text.strip()
+                cur.execute(
+                    """INSERT INTO schedules (group_id, day_of_week, location, week_type,
+                                              period_number, subject, teacher) 
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (grp_id, day, loc, week_type, num, subj, teacher),
+                )
+            else:
+                raw = " | ".join(td.text.strip() for td in tds)
+                cur.execute(
+                    "INSERT INTO schedules (group_id, day_of_week, location, week_type, raw_data) VALUES (%s,%s,%s,%s,%s)",
+                    (grp_id, day, loc, week_type, raw),
+                )
 
 ###############################################################################
 # CLI
 ###############################################################################
 
 def main(argv: Optional[List[str]] | None = None) -> None:
-    # logger.debug(f"Скрипт запущен из: {SCRIPT_DIR}")
-    # logger.debug(f"Базовая директория проекта (предполагаемая): {PROJECT_BASE_DIR}")
-    # logger.debug(f"Директория для данных по умолчанию: {DEFAULT_DATA_DIR}")
-    # logger.debug(f"Полный путь к БД по умолчанию: {CONSTRUCTED_DEFAULT_DB_PATH}")
-
-    ap = argparse.ArgumentParser(description="Парсит расписание МПТ в SQLite")
-    ap.add_argument(
-        "-d", "--db",
-        type=Path,
-        default=CONSTRUCTED_DEFAULT_DB_PATH,
-        help=f"файл SQLite (по умолчанию: {CONSTRUCTED_DEFAULT_DB_PATH})"
-    )
-    # Аргумент для интервала убран, используется константа PARSING_INTERVAL_SECONDS
+    ap = argparse.ArgumentParser(description="Парсит расписание МПТ в PostgreSQL")
     ap.add_argument("-l", "--list-groups", action="store_true", help="только вывести группы и выйти")
     args = ap.parse_args(argv)
 
@@ -319,15 +312,21 @@ def main(argv: Optional[List[str]] | None = None) -> None:
             conn = None 
             try:
                 html = fetch_html()
-                conn = init_db(args.db)
+                conn = init_db()
+                # Очищаем старые данные перед новым парсингом
+                with conn.cursor() as cur:
+                    logger.info("Очистка старых таблиц расписания...")
+                    cur.execute("TRUNCATE TABLE schedules, groups, specializations RESTART IDENTITY")
+                conn.commit()
+                
                 parse_and_store(conn, html)
-                logger.info("Данные успешно обработаны и сохранены в %s", args.db.resolve())
+                logger.info("Данные успешно обработаны и сохранены в PostgreSQL")
             except requests.exceptions.RequestException as e:
                 logger.error(f"Ошибка сети при получении HTML: {e}. Следующая попытка через {PARSING_INTERVAL_SECONDS} сек.")
-            except ParseError as err:
-                logger.error(f"Ошибка разбора HTML: {err}. Следующая попытка через {PARSING_INTERVAL_SECONDS} сек.")
-            except sqlite3.Error as e: # Более специфичная ошибка для БД
-                logger.error(f"Ошибка базы данных: {e}. Следующая попытка через {PARSING_INTERVAL_SECONDS} сек.", exc_info=True)
+            except (psycopg2.Error, ParseError) as err:
+                logger.error(f"Ошибка базы данных или парсинга: {err}. Следующая попытка через {PARSING_INTERVAL_SECONDS} сек.")
+                if conn:
+                    conn.rollback()
             except Exception as e: 
                 logger.error(f"Непредвиденная ошибка в цикле обработки: {e}. Следующая попытка через {PARSING_INTERVAL_SECONDS} сек.", exc_info=True)
             finally:
@@ -342,7 +341,6 @@ def main(argv: Optional[List[str]] | None = None) -> None:
         logger.info("\nПарсер остановлен пользователем (Ctrl+C). Завершение...")
     finally:
         logger.info("Парсер завершил свою работу.")
-
 
 def run_parser():
     main()

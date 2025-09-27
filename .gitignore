@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv
+venv/
+env/
+
+# IDE configuration files
+.idea/
+.vscode/
+
+# Configuration files with secrets
+config.ini
+
+# Obsolete SQLite databases
+navigator/data/*.db
+
+# OS-specific files
+.DS_Store
+Thumbs.db

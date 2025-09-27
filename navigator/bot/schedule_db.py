@@ -1,65 +1,77 @@
-import sqlite3
 import os
 from datetime import datetime
+import re
+import aiohttp
+from bs4 import BeautifulSoup
+
+# Импортируем пул соединений из user_db, чтобы использовать единый пул
+from .user_db import POOL
 
 # --- Настройки ---
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SCHEDULE_DB_PATH = os.path.join(SCRIPT_DIR, '..', 'data', 'schedule.db')
-REPLACEMENTS_DB_PATH = os.path.join(SCRIPT_DIR, '..', 'data', 'replacements.db')
+LIVE_URL = "https://mpt.ru/raspisanie/"
+WEEK_RE = re.compile(r"Неделя\s*[:\-]\s*(?P<type>[\wА-Яа-я]+)", re.I)
 
 # --- Функции для работы с расписанием ---
 
-def get_specializations():
-    """Получает список всех специальностей."""
-    conn = sqlite3.connect(SCHEDULE_DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM specializations ORDER BY name")
-    result = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return result
+async def get_current_week_type() -> str | None:
+    """Асинхронно получает тип текущей недели (Числитель/Знаменатель) с сайта."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(LIVE_URL, timeout=30) as response:
+                response.raise_for_status()
+                html = await response.text()
+                soup = BeautifulSoup(html, "html.parser")
+                if m := WEEK_RE.search(soup.get_text(" ", strip=True)):
+                    return m.group("type").upper()
+    except Exception as e:
+        print(f"Error fetching current week type: {e}")
+        return None
+    return "НЕИЗВЕСТНО"
 
-def get_groups_by_spec(specialization_name: str):
-    """Получает список групп для указанной специальности."""
-    conn = sqlite3.connect(SCHEDULE_DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT g.name 
-        FROM groups g
-        JOIN specializations s ON g.specialization_id = s.id
-        WHERE s.name = ?
-        ORDER BY g.name
-    """, (specialization_name,))
-    result = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return result
+async def get_specializations() -> list[str]:
+    """Асинхронно получает список всех специальностей."""
+    async with POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT name FROM specializations ORDER BY name")
+        return [row['name'] for row in rows]
 
-def get_schedule(group_name: str, date: datetime.date):
-    """Получает расписание для группы на указанную дату."""
+async def get_groups_by_spec(specialization_name: str) -> list[str]:
+    """Асинхронно получает список групп для указанной специальности."""
+    async with POOL.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT g.name 
+            FROM groups g
+            JOIN specializations s ON g.specialization_id = s.id
+            WHERE s.name = $1
+            ORDER BY g.name
+        """, specialization_name)
+        return [row['name'] for row in rows]
+
+async def get_schedule(group_name: str, date: datetime.date, week_type: str) -> list:
+    """Асинхронно получает расписание для группы на указанную дату и тип недели."""
     day_of_week = date.strftime('%A').upper()
-    conn = sqlite3.connect(SCHEDULE_DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT s.period_number, s.subject, s.teacher 
-        FROM schedules s
-        JOIN groups g ON s.group_id = g.id
-        WHERE g.name = ? AND s.day_of_week = ?
-    """, (group_name, day_of_week))
-    schedule = cursor.fetchall()
-    conn.close()
-    return schedule
+    async with POOL.acquire() as conn:
+        return await conn.fetch("""
+            SELECT s.period_number, s.subject, s.teacher 
+            FROM schedules s
+            JOIN groups g ON s.group_id = g.id
+            WHERE g.name = $1 AND s.day_of_week = $2 AND UPPER(s.week_type) = $3
+        """, group_name, day_of_week, week_type.upper())
 
-def get_replacements(group_name: str, date: datetime.date):
-    """Получает замены для группы на указанную дату."""
-    # replacements.db может не существовать, если парсер еще не запускался
-    if not os.path.exists(REPLACEMENTS_DB_PATH):
-        return []
-    conn = sqlite3.connect(REPLACEMENTS_DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT lesson_number, replacement_subject, replacement_teacher
-        FROM changes
-        WHERE group_name = ? AND change_date = ?
-    """, (group_name, date.strftime('%Y-%m-%d')))
-    replacements = cursor.fetchall()
-    conn.close()
-    return replacements
+async def get_replacements(group_name: str, date: datetime.date) -> list:
+    """Асинхронно получает замены для группы на указанную дату."""
+    async with POOL.acquire() as conn:
+        # Проверяем существование таблицы, а не файла
+        table_exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'changes'
+            );
+        """)
+        if not table_exists:
+            return []
+            
+        return await conn.fetch("""
+            SELECT lesson_number, replacement_subject, replacement_teacher
+            FROM changes
+            WHERE group_name = $1 AND change_date = $2
+        """, group_name, date)
