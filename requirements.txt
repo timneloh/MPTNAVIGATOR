@@ -1,0 +1,4 @@
+aiogram
+requests
+beautifulsoup4
+bs4
