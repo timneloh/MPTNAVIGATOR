@@ -120,8 +120,7 @@ def signal_handler(sig, frame):
         conn.close()
     sys.exit(0)
 
-# --- Основной цикл ---
-if __name__ == "__main__":
+def run_parser():
     conn = init_db()
     signal.signal(signal.SIGINT, signal_handler)
     
@@ -129,3 +128,7 @@ if __name__ == "__main__":
     while True:
         parse_schedule(conn)
         time.sleep(UPDATE_INTERVAL)
+
+# --- Основной цикл ---
+if __name__ == "__main__":
+    run_parser()

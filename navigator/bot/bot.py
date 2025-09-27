@@ -1,4 +1,5 @@
 import asyncio
+import multiprocessing
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -11,6 +12,9 @@ from navigator.bot.schedule_db import (
     get_specializations, get_groups_by_spec, get_schedule, 
     get_replacements, get_current_week_type
 )
+from navigator.parser.pars import run_parser as run_changes_parser
+from navigator.parser.dynamic_parser import run_parser as run_schedule_parser
+
 
 # --- Настройки ---
 API_TOKEN = '8091157857:AAGvuAq0q6PNmSzJj-3qw7FAwvyx02rDxBk'
@@ -204,8 +208,22 @@ async def weekly_schedule_show(callback: types.CallbackQuery, state: FSMContext)
 
 # --- Запуск бота ---
 async def main():
+    # Инициализация БД для бота
     await init_user_db()
+
+    # Запуск парсеров в отдельных процессах
+    print("Запуск фоновых парсеров...")
+    p1 = multiprocessing.Process(target=run_changes_parser, daemon=True)
+    p2 = multiprocessing.Process(target=run_schedule_parser, daemon=True)
+    p1.start()
+    p2.start()
+    print("Парсеры запущены.")
+
+    # Запуск бота
+    print("Запуск бота...")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
+    # На Windows для multiprocessing может потребоваться эта обертка
+    multiprocessing.freeze_support()
     asyncio.run(main())
