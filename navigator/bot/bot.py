@@ -6,6 +6,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.exceptions import TelegramBadRequest
 
 from navigator.bot.user_db import init_user_db, get_user_group, set_user_group
 from navigator.bot.schedule_db import (
@@ -27,9 +28,6 @@ class Reg(StatesGroup):
     choosing_spec = State()
     choosing_group = State()
 
-class Schedule(StatesGroup):
-    choosing_week = State()
-
 # --- Словарь для смены недели ---
 WEEK_FLIP = {
     "ЧИСЛИТЕЛЬ": "ЗНАМЕНАТЕЛЬ",
@@ -50,12 +48,6 @@ def main_keyboard():
 def profile_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Сменить группу", callback_data="change_group")]
-    ])
-
-def week_choice_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Числитель", callback_data="week_ЧИСЛИТЕЛЬ")],
-        [InlineKeyboardButton(text="Знаменатель", callback_data="week_ЗНАМЕНАТЕЛЬ")]
     ])
 
 def specs_keyboard(specs):
@@ -80,7 +72,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def start_registration(message_or_call: types.Message | types.CallbackQuery, state: FSMContext):
     specs = await get_specializations()
     if not specs:
-        await message_or_call.answer("Не удалось загрузить список специальностей. Попробуйте позже.")
+        await message_or_call.answer("Не удалось загрузить список специальностей. Пожалуйста, подождите, парсеры еще не завершили работу.")
         return
 
     await state.set_state(Reg.choosing_spec)
@@ -131,12 +123,37 @@ async def change_group(callback: types.CallbackQuery, state: FSMContext):
 def format_schedule(schedule, replacements):
     if not schedule and not replacements:
         return "На этот день расписание и замены не найдены."
+
     schedule_dict = {item['period_number']: (item['subject'], item['teacher']) for item in schedule}
+
+    # Применяем замены
     for rep in replacements:
-        schedule_dict[rep['lesson_number']] = (f"ЗАМЕНА: {rep['replacement_subject']}", rep['replacement_teacher'])
+        original_lesson = schedule_dict.get(rep['lesson_number'])
+        replacement_text = f"ЗАМЕНА: {rep['replacement_subject']}"
+        
+        if original_lesson:
+            original_subject, _ = original_lesson
+            replacement_text += f" (было: {original_subject})"
+        
+        schedule_dict[rep['lesson_number']] = (replacement_text, rep['replacement_teacher'])
+
     if not schedule_dict:
         return "На этот день расписание не найдено."
-    return "\n".join([f" пара: {subj} ({teacher})" for _, (subj, teacher) in sorted(schedule_dict.items())])
+
+    # Формируем итоговый текст
+    formatted_lines = []
+    for lesson_num, (subj, teacher) in sorted(schedule_dict.items()):
+        # Проверяем, является ли номер пары числом для корректной сортировки
+        try:
+            sort_key = int(lesson_num)
+        except (ValueError, TypeError):
+            sort_key = float('inf') # Помещаем нечисловые пары (напр. "ПРАКТИКА") в конец
+        formatted_lines.append((sort_key, f"{lesson_num} пара: {subj} ({teacher})"))
+    
+    # Сортируем строки по числовому номеру пары
+    formatted_lines.sort(key=lambda x: x[0])
+    
+    return "\n".join([line for _, line in formatted_lines])
 
 async def send_schedule(message: types.Message, date: datetime.date, day_text: str):
     user_id = message.from_user.id
@@ -146,7 +163,7 @@ async def send_schedule(message: types.Message, date: datetime.date, day_text: s
         return
 
     current_week_type = await get_current_week_type()
-    if not current_week_type:
+    if not current_week_type or current_week_type == "НЕИЗВЕСТНО":
         await message.answer("Не удалось определить тип текущей недели. Попробуйте позже.")
         return
 
@@ -169,32 +186,22 @@ async def schedule_today(message: types.Message):
 async def schedule_tomorrow(message: types.Message):
     await send_schedule(message, datetime.now().date() + timedelta(days=1), "завтра")
 
-# --- Расписание на неделю ---
-@dp.message(F.text == "Расписание на неделю")
-async def weekly_schedule_start(message: types.Message, state: FSMContext):
-    await state.set_state(Schedule.choosing_week)
-    await message.answer("Выберите неделю:", reply_markup=week_choice_keyboard())
+# --- Новая логика для расписания на неделю ---
 
-@dp.callback_query(StateFilter(Schedule.choosing_week), F.data.startswith('week_'))
-async def weekly_schedule_show(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    week_type = callback.data.split('_', 1)[1]
-    group = await get_user_group(callback.from_user.id)
-    if not group:
-        await callback.message.edit_text("Сначала выберите группу через /start или Профиль.")
-        await callback.answer()
-        return
-
+async def get_weekly_schedule_text_and_keyboard(group: str, week_type: str):
+    """Готовит текст расписания на неделю и клавиатуру для переключения."""
     days = ["ПОНЕДЕЛЬНИК", "ВТОРНИК", "СРЕДА", "ЧЕТВЕРГ", "ПЯТНИЦА", "СУББОТА"]
     full_schedule_text = []
-    base_date = datetime.now()
-    while base_date.strftime('%A').upper() != days[0]:
-        base_date -= timedelta(days=1)
+    
+    today = datetime.now()
+    base_date = today - timedelta(days=today.weekday())
 
     for i, day_name in enumerate(days):
         date_for_day = base_date + timedelta(days=i)
+        # Для расписания на неделю замены не ищем, чтобы не перегружать
         schedule_data = await get_schedule(group, date_for_day, week_type)
         if schedule_data:
+            # Используем format_schedule без замен
             formatted = format_schedule(schedule_data, [])
             full_schedule_text.append(f"**{day_name.capitalize()}**:\n{formatted}")
     
@@ -203,7 +210,45 @@ async def weekly_schedule_show(callback: types.CallbackQuery, state: FSMContext)
     else:
         response = f"**Расписание на неделю ({week_type.capitalize()}) для группы {group}**:\n\n" + "\n\n".join(full_schedule_text)
 
-    await callback.message.edit_text(response, parse_mode="Markdown")
+    other_week = WEEK_FLIP.get(week_type, "ЧИСЛИТЕЛЬ")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Показать {other_week.lower()}", callback_data=f"show_week_{other_week}")]
+    ])
+    
+    return response, keyboard
+
+@dp.message(F.text == "Расписание на неделю")
+async def weekly_schedule_entry(message: types.Message):
+    """Обрабатывает нажатие кнопки 'Расписание на неделю'."""
+    group = await get_user_group(message.from_user.id)
+    if not group:
+        await message.answer("Сначала выберите группу в Профиле.")
+        return
+
+    current_week = await get_current_week_type()
+    if not current_week or current_week == "НЕИЗВЕСТНО":
+        await message.answer("Не удалось определить тип текущей недели. Попробуйте позже.")
+        return
+        
+    text, keyboard = await get_weekly_schedule_text_and_keyboard(group, current_week)
+    await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("show_week_"))
+async def weekly_schedule_switch(callback: types.CallbackQuery):
+    """Обрабатывает переключение недели в расписании на неделю."""
+    week_type = callback.data.split('_', 2)[2]
+    group = await get_user_group(callback.from_user.id)
+    if not group:
+        await callback.message.edit_text("Сначала выберите группу в Профиле.")
+        await callback.answer()
+        return
+
+    text, keyboard = await get_weekly_schedule_text_and_keyboard(group, week_type)
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    except TelegramBadRequest:
+        # Это исключение возникает, если текст сообщения не изменился. Просто игнорируем.
+        pass
     await callback.answer()
 
 # --- Запуск бота ---

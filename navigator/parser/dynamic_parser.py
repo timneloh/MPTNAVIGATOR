@@ -74,7 +74,7 @@ def init_db() -> psycopg2.extensions.connection:
     
     # Используем with для автоматического управления курсором
     with conn.cursor() as cur:
-        cur.execute("PRAGMA foreign_keys = ON;") # PRAGMA - это SQLite-специфичная команда, в PG не нужна
+        # PRAGMA foreign_keys = ON; -- УДАЛЕНО, т.к. несовместимо с PostgreSQL
         # Вместо executescript, который может быть неидеален, выполним каждую команду
         for statement in SCHEMA_SQL.split(';'):
             if statement.strip():

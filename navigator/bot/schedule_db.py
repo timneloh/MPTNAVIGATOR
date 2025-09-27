@@ -4,8 +4,8 @@ import re
 import aiohttp
 from bs4 import BeautifulSoup
 
-# Импортируем пул соединений из user_db, чтобы использовать единый пул
-from .user_db import POOL
+# Импортируем модуль user_db целиком, чтобы избежать проблем с состоянием импорта
+from . import user_db
 
 # --- Настройки ---
 LIVE_URL = "https://mpt.ru/raspisanie/"
@@ -30,13 +30,13 @@ async def get_current_week_type() -> str | None:
 
 async def get_specializations() -> list[str]:
     """Асинхронно получает список всех специальностей."""
-    async with POOL.acquire() as conn:
+    async with user_db.POOL.acquire() as conn:
         rows = await conn.fetch("SELECT name FROM specializations ORDER BY name")
         return [row['name'] for row in rows]
 
 async def get_groups_by_spec(specialization_name: str) -> list[str]:
     """Асинхронно получает список групп для указанной специальности."""
-    async with POOL.acquire() as conn:
+    async with user_db.POOL.acquire() as conn:
         rows = await conn.fetch("""
             SELECT g.name 
             FROM groups g
@@ -48,8 +48,19 @@ async def get_groups_by_spec(specialization_name: str) -> list[str]:
 
 async def get_schedule(group_name: str, date: datetime.date, week_type: str) -> list:
     """Асинхронно получает расписание для группы на указанную дату и тип недели."""
-    day_of_week = date.strftime('%A').upper()
-    async with POOL.acquire() as conn:
+    # Словарь для надежного определения дня недели вне зависимости от локали
+    DAYS_MAP = {
+        0: "ПОНЕДЕЛЬНИК",
+        1: "ВТОРНИК",
+        2: "СРЕДА",
+        3: "ЧЕТВЕРГ",
+        4: "ПЯТНИЦА",
+        5: "СУББОТА",
+        6: "ВОСКРЕСЕНЬЕ"
+    }
+    day_of_week = DAYS_MAP.get(date.weekday(), "НЕИЗВЕСТНО")
+    
+    async with user_db.POOL.acquire() as conn:
         return await conn.fetch("""
             SELECT s.period_number, s.subject, s.teacher 
             FROM schedules s
@@ -59,7 +70,7 @@ async def get_schedule(group_name: str, date: datetime.date, week_type: str) -> 
 
 async def get_replacements(group_name: str, date: datetime.date) -> list:
     """Асинхронно получает замены для группы на указанную дату."""
-    async with POOL.acquire() as conn:
+    async with user_db.POOL.acquire() as conn:
         # Проверяем существование таблицы, а не файла
         table_exists = await conn.fetchval("""
             SELECT EXISTS (
